@@ -1,0 +1,8 @@
+# El parser de AST y Winnowing usa solo la biblioteca estandar de Python (ast,
+# hashlib, csv, itertools) -> no requiere dependencias externas.
+#
+# Las dependencias de abajo son para el modelo de ML en model.ipynb.
+numpy
+pandas
+scikit-learn
+tensorflow
