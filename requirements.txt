@@ -7,3 +7,5 @@ pandas
 scikit-learn
 tensorflow
 matplotlib
+# Lectura/escritura de los .parquet del nuevo dataset (new_data/)
+pyarrow

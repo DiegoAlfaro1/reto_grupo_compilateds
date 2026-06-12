@@ -1,7 +1,12 @@
 dataset/
 data/
+new_data/
 pipeline_disabled/
 .claude
+
+# Características derivadas del nuevo dataset (regenerables con
+# python -m pipeline.build_snippets)
+new_data_features/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

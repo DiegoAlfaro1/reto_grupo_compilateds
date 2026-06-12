@@ -35,6 +35,45 @@ Cambios de la iteración 2:
 **F1 0.972** · AUC 0.999 — supera las metas del marco (sección 8.3) y la
 línea base de Dolos (F1 = 0.865).
 
+## Iteración 3 — nuevo dataset en parquet (`new_data/`)
+
+La iteración 3 adapta el sistema a un nuevo dataset cuya tarea es
+**detectar código generado por máquina** (LLMs): cada fila trae un snippet
+individual con `code`, `generator`, `language` y `label`
+(0 = humano, 1 = generado por máquina). Splits oficiales:
+entrenamiento (500k), validación (100k) y muestra de prueba (1k).
+
+- **La arquitectura del modelo no cambia** (misma red basada en el paper
+  de Dolos: Dense 32 → Dropout 0.2 → Dense 16 → sigmoide).
+- **Cambia la alimentación de datos**: como ya no hay pares de archivos,
+  `pipeline/snippet_features.py` calcula 16 características *intrínsecas*
+  por snippet con la misma maquinaria (tokenización AST normalizada +
+  Winnowing k=15, w=4) más métricas de estilo (comentarios, líneas en
+  blanco, identificadores...). Para lenguajes distintos de Python,
+  `pipeline/snippet_tokenizer.py` usa un tokenizador léxico genérico
+  (mismo enfoque multi-lenguaje de Dolos).
+
+```bash
+# 1) Generar las características de cada split (parquet → parquet)
+python -m pipeline.build_snippets --input new_data/task_a_training_set_1.parquet \
+    --output new_data_features/train_features.parquet --k 15 --w 4 --workers 10
+python -m pipeline.build_snippets --input new_data/task_a_validation_set.parquet \
+    --output new_data_features/validation_features.parquet --k 15 --w 4 --workers 10
+python -m pipeline.build_snippets --input new_data/task_a_test_set_sample.parquet \
+    --output new_data_features/test_features.parquet --k 15 --w 4 --workers 10
+
+# 2) Entrenar y evaluar
+jupyter notebook model_new_data.ipynb
+```
+
+`model_new_data.ipynb` entrena con el split oficial de entrenamiento,
+ajusta el umbral de decisión en validación (sección 8.2 del marco) y
+reporta sobre validación y prueba: **Precision, Recall, F1 y AUC-ROC**,
+la **matriz de confusión** y una **gráfica de barras del F1 contra la
+línea base de Dolos (0.865)**. Artefactos: `ai_code_model.keras`,
+`scaler_new_data.joblib`, `decision_threshold_new_data.json` y las
+figuras en `results/`.
+
 ## Arquitectura del pipeline
 
 ```
