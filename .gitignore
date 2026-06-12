@@ -1,6 +1,7 @@
 dataset/
 data/
 pipeline_disabled/
+.claude
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
