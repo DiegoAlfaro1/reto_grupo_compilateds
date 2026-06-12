@@ -1,151 +1,220 @@
-"""Tokenizador basado en el Arbol de Sintaxis Abstracta (AST) de Python.
+"""
+pipeline/ast_tokenizer.py
+─────────────────────────
+Convierte un archivo .py en una secuencia de tokens normalizados
+usando el módulo `ast` de la biblioteca estándar de Python.
 
-Convierte el codigo fuente de un archivo ``.py`` en una secuencia de tokens
-normalizados. La normalizacion (enmascaramiento) hace que el analisis sea
-insensible a las transformaciones de plagio mas comunes:
+Niveles de enmascaramiento
+--------------------------
+  low    → solo enmascara nombres de variables/parámetros (Name, arg)
+  medium → low + literales numéricos y de cadena (Constant)
+  high   → medium + nombres de atributos (Attribute) y de funciones llamadas (Call)
 
-* Renombrado de variables / funciones  -> los identificadores se enmascaran.
-* Cambios de formato, comentarios, lineas vacias -> el AST los ignora por
-  construccion (un comentario no produce ningun nodo).
-* Reordenamiento de bloques -> se mitiga mas adelante por Winnowing, ya que las
-  subcadenas compartidas se detectan sin importar su posicion.
+Uso rápido
+----------
+    from pipeline.ast_tokenizer import tokenize_file, tokenize_source
 
-El nivel de enmascaramiento es la variable independiente "Nivel de
-enmascaramiento" (Bajo / Medio / Alto) del marco de referencia.
+    tokens = tokenize_file("solucion.py", masking="medium")
+    # → ["Module", "FunctionDef", "VAR", "For", "VAR", "VAR", "LIT", ...]
 """
 
-from __future__ import annotations
-
 import ast
-from enum import Enum
-from typing import List
+from pathlib import Path
+from typing import Union
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Constantes de enmascaramiento
+# ──────────────────────────────────────────────────────────────────────────────
+
+MASK_VAR   = "VAR"    # identificador (variable, parámetro, función definida)
+MASK_LIT   = "LIT"    # literal (número, cadena, booleano, None)
+MASK_ATTR  = "ATTR"   # acceso a atributo  (obj.campo)
+MASK_CALL  = "CALL"   # nombre de función llamada
 
 
-class MaskingLevel(str, Enum):
-    """Cuanta informacion del codigo se conserva en los tokens.
+# ──────────────────────────────────────────────────────────────────────────────
+# Visitor principal
+# ──────────────────────────────────────────────────────────────────────────────
 
-    * ``LOW``    -> conserva nombres de identificadores y valores de literales.
-                    (Mas discriminativo, mas fragil ante renombrado.)
-    * ``MEDIUM`` -> enmascara identificadores; conserva tipos de literales.
-                    (Recomendado: insensible a renombrado de variables.)
-    * ``HIGH``   -> enmascara identificadores y literales; solo queda la
-                    estructura sintactica pura. (Mas robusto ante ofuscacion.)
+class ASTTokenizer(ast.NodeVisitor):
+    """
+    Recorre el AST en orden de visita (pre-orden DFS) y emite
+    una secuencia de tokens string para cada nodo.
+
+    Parámetros
+    ----------
+    masking : {"low", "medium", "high"}
+        Nivel de normalización de identificadores y literales.
     """
 
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
+    def __init__(self, masking: str = "medium"):
+        if masking not in ("low", "medium", "high"):
+            raise ValueError(f"masking debe ser 'low', 'medium' o 'high'; recibido: {masking!r}")
+        self.masking = masking
+        self.tokens: list[str] = []
+        self._depth = 0          # profundidad actual en el árbol
+        self.max_depth = 0       # profundidad máxima alcanzada
 
-
-# Tokens genericos usados al enmascarar.
-_MASK_NAME = "<NAME>"
-_MASK_ATTR = "<ATTR>"
-_MASK_ARG = "<ARG>"
-
-
-class _Tokenizer(ast.NodeVisitor):
-    """Recorre el AST en pre-orden y emite un token por nodo.
-
-    El recorrido en pre-orden preserva el orden estructural del codigo, que es
-    justo lo que necesita el motor de Winnowing para detectar subcadenas
-    compartidas.
-    """
-
-    def __init__(self, level: MaskingLevel) -> None:
-        self.level = level
-        self.tokens: List[str] = []
-
-    # -- helpers ---------------------------------------------------------
+    # ── Método central ────────────────────────────────────────────────────────
 
     def _emit(self, token: str) -> None:
         self.tokens.append(token)
 
-    def _ident(self, name: str, mask_token: str) -> str:
-        """Devuelve el identificador o su mascara segun el nivel."""
-        if self.level == MaskingLevel.LOW:
-            return name
-        return mask_token
-
-    # -- nodos con tratamiento especial ----------------------------------
-
-    def visit_Name(self, node: ast.Name) -> None:
-        # Variable / referencia a nombre.
-        self._emit(self._ident(node.id, _MASK_NAME))
-        self.generic_visit(node)
-
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        # obj.attr  -> el nombre del atributo tambien es un identificador.
-        self._emit("Attribute:" + self._ident(node.attr, _MASK_ATTR))
-        self.generic_visit(node)
-
-    def visit_arg(self, node: ast.arg) -> None:
-        self._emit("arg:" + self._ident(node.arg, _MASK_ARG))
-        self.generic_visit(node)
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._emit("FunctionDef:" + self._ident(node.name, _MASK_NAME))
-        self.generic_visit(node)
-
-    visit_AsyncFunctionDef = visit_FunctionDef  # mismo tratamiento
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self._emit("ClassDef:" + self._ident(node.name, _MASK_NAME))
-        self.generic_visit(node)
-
-    def visit_Constant(self, node: ast.Constant) -> None:
-        # Literales: numeros, cadenas, booleanos, None, etc.
-        if self.level == MaskingLevel.HIGH:
-            # Solo conservamos el *tipo* del literal, no su valor.
-            self._emit("Constant:" + type(node.value).__name__)
-        elif self.level == MaskingLevel.MEDIUM:
-            self._emit("Constant:" + type(node.value).__name__)
-        else:  # LOW -> conservamos el valor.
-            self._emit("Constant:" + repr(node.value))
-        self.generic_visit(node)
-
-    # -- caso general ----------------------------------------------------
-
     def generic_visit(self, node: ast.AST) -> None:
-        # Para cualquier otro nodo emitimos su tipo. Esto cubre operadores
-        # (Add, Sub, ...), estructuras de control (For, While, If, ...),
-        # comparadores, etc., que son la "forma" del programa.
-        self._emit(type(node).__name__)
-        super().generic_visit(node)
+        """
+        Llamado para cada nodo.  Emite el tipo del nodo y luego
+        visita recursivamente sus hijos.
+        """
+        node_type = type(node).__name__
+
+        # Actualizar profundidad
+        self._depth += 1
+        if self._depth > self.max_depth:
+            self.max_depth = self._depth
+
+        # ── Nodos que se procesan con lógica especial ──────────────────────
+
+        if isinstance(node, ast.Name):
+            self._handle_Name(node)
+
+        elif isinstance(node, ast.arg):
+            self._handle_arg(node)
+
+        elif isinstance(node, ast.Constant):
+            self._handle_Constant(node)
+
+        elif isinstance(node, ast.Attribute):
+            self._handle_Attribute(node)
+
+        elif isinstance(node, ast.Call):
+            self._handle_Call(node)
+
+        # ── Nodos de definición de funciones/clases: emitir tipo + nombre ──
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self._emit(node_type)
+            self._emit(MASK_VAR)   # el nombre de la función siempre se enmascara
+
+        elif isinstance(node, ast.ClassDef):
+            self._emit(node_type)
+            self._emit(MASK_VAR)
+
+        # ── Resto de nodos: emitir solo el tipo ────────────────────────────
+        else:
+            self._emit(node_type)
+
+        # Visitar hijos
+        for child in ast.iter_child_nodes(node):
+            self.visit(child)
+
+        self._depth -= 1
+
+    # ── Manejadores por tipo de nodo ──────────────────────────────────────────
+
+    def _handle_Name(self, node: ast.Name) -> None:
+        """Variables y nombres en expresiones."""
+        # low, medium y high enmascaran todos los Name
+        self._emit(MASK_VAR)
+
+    def _handle_arg(self, node: ast.arg) -> None:
+        """Parámetros de funciones."""
+        self._emit(MASK_VAR)
+        # Visitar anotación de tipo si existe (pero no el nombre)
+        if node.annotation:
+            self.visit(node.annotation)
+
+    def _handle_Constant(self, node: ast.Constant) -> None:
+        """Literales: números, cadenas, booleanos, None."""
+        if self.masking in ("medium", "high"):
+            self._emit(MASK_LIT)
+        else:
+            # low: distingue al menos el tipo del literal
+            self._emit(f"Constant_{type(node.value).__name__}")
+
+    def _handle_Attribute(self, node: ast.Attribute) -> None:
+        """Accesos a atributos: obj.campo"""
+        if self.masking == "high":
+            # Enmascara el nombre del atributo
+            self._emit("Attribute")
+            self._emit(MASK_ATTR)
+            # Visitar el objeto receptor (puede ser otra expresión)
+            self.visit(node.value)
+        else:
+            # low/medium: emite el tipo, visita normalmente
+            self._emit("Attribute")
+            self.visit(node.value)
+
+    def _handle_Call(self, node: ast.Call) -> None:
+        """Llamadas a funciones/métodos."""
+        self._emit("Call")
+        if self.masking == "high":
+            # Enmascara el nombre de la función llamada si es un Name simple
+            if isinstance(node.func, ast.Name):
+                self._emit(MASK_CALL)
+            elif isinstance(node.func, ast.Attribute):
+                # método: enmascara el atributo pero visita el receptor
+                self._emit("Attribute")
+                self._emit(MASK_CALL)
+                self.visit(node.func.value)
+            else:
+                self.visit(node.func)
+        else:
+            self.visit(node.func)
+
+        # Visitar argumentos posicionales y con nombre
+        for arg in node.args:
+            self.visit(arg)
+        for kw in node.keywords:
+            self.visit(kw.value)
 
 
-def tokenize_source(source: str, level: MaskingLevel = MaskingLevel.MEDIUM) -> List[str]:
-    """Tokeniza una cadena de codigo Python.
+# ──────────────────────────────────────────────────────────────────────────────
+# Funciones públicas
+# ──────────────────────────────────────────────────────────────────────────────
 
-    Lanza ``SyntaxError`` si el codigo no es Python valido; el llamador decide
-    como manejar archivos no parseables.
+def tokenize_source(
+    source: str,
+    masking: str = "medium",
+    filename: str = "<string>",
+) -> dict:
     """
-    tree = ast.parse(source)
-    tokenizer = _Tokenizer(level)
-    # No emitimos el token del nodo Module raiz para no introducir ruido
-    # constante; recorremos directamente sus hijos.
-    for child in ast.iter_child_nodes(tree):
-        tokenizer.visit(child)
-    return tokenizer.tokens
+    Tokeniza código fuente Python dado como string.
 
-
-def tokenize_file(path: str, level: MaskingLevel = MaskingLevel.MEDIUM) -> List[str]:
-    """Lee y tokeniza un archivo ``.py`` (UTF-8, ignora errores de encoding)."""
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-        source = fh.read()
-    return tokenize_source(source, level)
-
-
-def ast_depth(source: str) -> int:
-    """Profundidad maxima del AST (longitud del camino mas largo raiz->hoja).
-
-    Es una medida estructural global del codigo; la diferencia de profundidad
-    entre dos archivos es una de las caracteristicas del modelo.
+    Retorna
+    -------
+    dict con:
+      "tokens"    : list[str]  — secuencia de tokens normalizados
+      "max_depth" : int        — profundidad máxima del AST
+      "error"     : str | None — mensaje de error si el código no es válido
     """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError as exc:
+        return {"tokens": [], "max_depth": 0, "error": str(exc)}
 
-    def _depth(node: ast.AST) -> int:
-        children = list(ast.iter_child_nodes(node))
-        if not children:
-            return 1
-        return 1 + max(_depth(c) for c in children)
+    visitor = ASTTokenizer(masking=masking)
+    visitor.visit(tree)
 
-    return _depth(ast.parse(source))
+    return {
+        "tokens": visitor.tokens,
+        "max_depth": visitor.max_depth,
+        "error": None,
+    }
+
+
+def tokenize_file(
+    path: Union[str, Path],
+    masking: str = "medium",
+    encoding: str = "utf-8",
+) -> dict:
+    """
+    Tokeniza un archivo .py en disco.
+
+    Retorna el mismo dict que `tokenize_source`.
+    """
+    path = Path(path)
+    try:
+        source = path.read_text(encoding=encoding)
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"tokens": [], "max_depth": 0, "error": str(exc)}
+
+    return tokenize_source(source, masking=masking, filename=str(path))

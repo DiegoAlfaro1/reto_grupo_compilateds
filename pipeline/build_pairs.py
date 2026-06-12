@@ -1,237 +1,322 @@
-"""Construye el dataset de pares etiquetados y escribe ``pairs_features.csv``.
+"""
+pipeline/build_pairs.py
+───────────────────────
+Genera el archivo pairs_features.csv que consume model.ipynb.
 
-Implementa la "Construccion de pares etiquetados" descrita en el marco de
-referencia (seccion 8.1) sobre el dataset *Code Similarity Dataset - Python
-Variants* de Kaggle:
+Recorre el dataset de Kaggle, construye pares etiquetados y calcula
+las 5 características por par usando el pipeline completo:
+    ast_tokenizer → winnowing → features
 
-* Par POSITIVO (label 1): dos variantes del MISMO problema.
-* Par NEGATIVO (label 0): dos soluciones de problemas DISTINTOS.
+Estructura esperada del dataset
+--------------------------------
+    data_dir/
+        problema_1/
+            snippets/
+                snip_01.py
+                snip_02.py
+                ...
+        problema_2/
+            snippets/
+                ...
 
-Las clases se balancean (igual numero de pares positivos y negativos).
+Etiquetas
+---------
+    1  →  par positivo: dos .py del MISMO problema
+    0  →  par negativo: dos .py de problemas DISTINTOS
 
-Uso tipico:
+Uso desde línea de comandos
+---------------------------
+    python -m pipeline.build_pairs \\
+        --data-dir ./data/python_variants \\
+        --output   pairs_features.csv \\
+        --k        23 \\
+        --w        4  \\
+        --masking  medium
 
-    python -m pipeline.build_pairs --data-dir ./data/python_variants \
-        --output pairs_features.csv
+Uso desde Python
+----------------
+    from pipeline.build_pairs import build_pairs_csv
 
-Estructura de carpetas esperada por defecto: cada problema es una subcarpeta
-que contiene sus archivos ``.py`` (una por variante)::
-
-    data/python_variants/
-        problem_001/
-            variant_01.py
-            variant_02.py
-            ...
-        problem_002/
-            ...
-
-Si tu copia del dataset usa otra organizacion, ajusta ``--group-by`` (carpeta
-padre, abuela, o un patron de nombre de archivo).
+    build_pairs_csv(
+        data_dir="./data/python_variants",
+        output="pairs_features.csv",
+        k=23, w=4, masking="medium",
+    )
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import os
+import itertools
 import random
-import re
-from collections import defaultdict
-from itertools import combinations
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 
-from .ast_tokenizer import MaskingLevel
-from .features import (
-    FEATURE_COLUMNS,
-    LABEL_COLUMN,
-    CodeProfile,
-    build_profile,
-    pair_features,
-)
-from .winnowing import DEFAULT_K, DEFAULT_W
+from pipeline.ast_tokenizer import tokenize_file
+from pipeline.winnowing import winnow
+from pipeline.features import compute_features, FEATURE_COLUMNS
 
 
-def find_python_files(data_dir: str) -> List[str]:
-    """Lista recursivamente todos los archivos ``.py`` bajo ``data_dir``."""
-    paths: List[str] = []
-    for root, _dirs, files in os.walk(data_dir):
-        for name in files:
-            if name.endswith(".py"):
-                paths.append(os.path.join(root, name))
-    return sorted(paths)
+# ──────────────────────────────────────────────────────────────────────────────
+# Recolección de archivos por problema
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-def problem_id_for(path: str, data_dir: str, group_by: str) -> str:
-    """Determina a que problema pertenece un archivo.
-
-    * ``parent``      -> nombre de la carpeta que contiene el archivo (default).
-    * ``grandparent`` -> nombre de la carpeta abuela.
-    * ``filename``    -> prefijo del nombre del archivo antes del primer '_' o
-                         digito (p. ej. ``problem12_v3.py`` -> ``problem``).
+def _collect_problems(data_dir: Path) -> dict[str, list[Path]]:
     """
-    if group_by == "parent":
-        return os.path.basename(os.path.dirname(path))
-    if group_by == "grandparent":
-        return os.path.basename(os.path.dirname(os.path.dirname(path)))
-    if group_by == "filename":
-        base = os.path.splitext(os.path.basename(path))[0]
-        m = re.match(r"([A-Za-z]+)", base)
-        return m.group(1) if m else base
-    raise ValueError(f"group_by desconocido: {group_by}")
+    Recorre data_dir y devuelve un dict:
+        { nombre_problema: [lista de archivos .py] }
 
-
-def group_files_by_problem(
-    paths: List[str], data_dir: str, group_by: str
-) -> Dict[str, List[str]]:
-    groups: Dict[str, List[str]] = defaultdict(list)
-    for p in paths:
-        groups[problem_id_for(p, data_dir, group_by)].append(p)
-    # Solo conservamos problemas con >= 2 variantes (necesarias para un par +).
-    return {pid: files for pid, files in groups.items() if len(files) >= 2}
-
-
-def _load_profiles(
-    paths: List[str], k: int, w: int, level: MaskingLevel
-) -> Dict[str, CodeProfile]:
-    """Tokeniza y genera huellas de cada archivo una sola vez (cacheado)."""
-    profiles: Dict[str, CodeProfile] = {}
-    skipped = 0
-    for p in paths:
-        try:
-            with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                source = fh.read()
-            profiles[p] = build_profile(source, k, w, level)
-        except SyntaxError:
-            skipped += 1  # archivo no parseable; lo ignoramos.
-    if skipped:
-        print(f"  Aviso: {skipped} archivo(s) omitido(s) por errores de sintaxis.")
-    return profiles
-
-
-def generate_pairs(
-    groups: Dict[str, List[str]],
-    profiles: Dict[str, CodeProfile],
-    max_pos_per_problem: Optional[int],
-    rng: random.Random,
-) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
-    """Genera pares positivos (intra-problema) y negativos (inter-problema).
-
-    Los negativos se muestrean aleatoriamente y se balancean al numero de
-    positivos.
+    Soporta dos layouts:
+      A) data_dir/problema/snippets/*.py   (layout Kaggle)
+      B) data_dir/problema/*.py            (layout plano)
     """
-    # Positivos: combinaciones dentro de cada problema.
-    positives: List[Tuple[str, str]] = []
-    for files in groups.values():
-        files = [f for f in files if f in profiles]
-        pairs = list(combinations(files, 2))
-        if max_pos_per_problem is not None and len(pairs) > max_pos_per_problem:
-            pairs = rng.sample(pairs, max_pos_per_problem)
-        positives.extend(pairs)
+    problems: dict[str, list[Path]] = {}
 
-    # Negativos: pares entre problemas distintos, hasta igualar a los positivos.
-    problem_ids = list(groups.keys())
-    negatives: List[Tuple[str, str]] = []
-    seen: set = set()
-    target = len(positives)
-    attempts = 0
-    max_attempts = target * 50 + 1000
-    while len(negatives) < target and attempts < max_attempts:
-        attempts += 1
-        if len(problem_ids) < 2:
-            break
-        pid_a, pid_b = rng.sample(problem_ids, 2)
-        fa = [f for f in groups[pid_a] if f in profiles]
-        fb = [f for f in groups[pid_b] if f in profiles]
-        if not fa or not fb:
+    for problem_dir in sorted(data_dir.iterdir()):
+        if not problem_dir.is_dir():
             continue
-        a = rng.choice(fa)
-        b = rng.choice(fb)
-        key = tuple(sorted((a, b)))
-        if key in seen:
+
+        # Layout A: carpeta snippets/
+        snippets_dir = problem_dir / "snippets"
+        if snippets_dir.is_dir():
+            files = sorted(snippets_dir.glob("*.py"))
+        else:
+            # Layout B: .py directamente en la carpeta del problema
+            files = sorted(problem_dir.glob("*.py"))
+
+        if files:
+            problems[problem_dir.name] = files
+
+    return problems
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Preprocesamiento de un archivo
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _preprocess(path: Path, masking: str, k: int, w: int) -> dict | None:
+    """
+    Tokeniza un .py y genera sus fingerprints.
+    Retorna None si el archivo tiene errores de sintaxis o está vacío.
+    """
+    result = tokenize_file(path, masking=masking)
+    if result["error"] or not result["tokens"]:
+        return None
+
+    fps = winnow(result["tokens"], k=k, w=w)
+    return {
+        "tokens":    result["tokens"],
+        "depth":     result["max_depth"],
+        "fps":       fps,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Construcción de pares
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_positive_pairs(
+    files: list[Path],
+    cache: dict[Path, dict],
+    masking: str,
+    k: int,
+    w: int,
+) -> list[dict]:
+    """
+    Genera todos los pares C(n,2) dentro de un mismo problema (label=1).
+    """
+    pairs = []
+    for path_a, path_b in itertools.combinations(files, 2):
+        # Preprocesar y cachear
+        if path_a not in cache:
+            cache[path_a] = _preprocess(path_a, masking, k, w)
+        if path_b not in cache:
+            cache[path_b] = _preprocess(path_b, masking, k, w)
+
+        data_a = cache[path_a]
+        data_b = cache[path_b]
+
+        if data_a is None or data_b is None:
             continue
-        seen.add(key)
-        negatives.append((a, b))
 
-    return positives, negatives
-
-
-def write_csv(
-    output: str,
-    positives: List[Tuple[str, str]],
-    negatives: List[Tuple[str, str]],
-    profiles: Dict[str, CodeProfile],
-) -> int:
-    """Calcula caracteristicas de cada par y escribe el CSV. Devuelve # filas."""
-    header = FEATURE_COLUMNS + [LABEL_COLUMN]
-    rows = 0
-    with open(output, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=header)
-        writer.writeheader()
-        for label, pairs in ((1, positives), (0, negatives)):
-            for a, b in pairs:
-                feats = pair_features(profiles[a], profiles[b])
-                feats[LABEL_COLUMN] = label
-                writer.writerow(feats)
-                rows += 1
-    return rows
-
-
-def main(argv: Optional[List[str]] = None) -> None:
-    parser = argparse.ArgumentParser(
-        description="Genera pairs_features.csv para el modelo de plagio."
-    )
-    parser.add_argument(
-        "--data-dir", required=True,
-        help="Carpeta raiz del dataset (con los .py organizados por problema).",
-    )
-    parser.add_argument(
-        "--output", default="pairs_features.csv",
-        help="Ruta del CSV de salida (default: pairs_features.csv).",
-    )
-    parser.add_argument("--k", type=int, default=DEFAULT_K, help="Tamano de k-grama.")
-    parser.add_argument("--w", type=int, default=DEFAULT_W, help="Ventana Winnowing.")
-    parser.add_argument(
-        "--masking", choices=[m.value for m in MaskingLevel],
-        default=MaskingLevel.MEDIUM.value, help="Nivel de enmascaramiento.",
-    )
-    parser.add_argument(
-        "--group-by", choices=["parent", "grandparent", "filename"],
-        default="parent", help="Como agrupar archivos por problema.",
-    )
-    parser.add_argument(
-        "--max-pos-per-problem", type=int, default=None,
-        help="Limite de pares positivos por problema (muestreo). Default: todos.",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Semilla aleatoria.")
-    args = parser.parse_args(argv)
-
-    rng = random.Random(args.seed)
-    level = MaskingLevel(args.masking)
-
-    print(f"Buscando archivos .py en {args.data_dir} ...")
-    paths = find_python_files(args.data_dir)
-    print(f"  {len(paths)} archivo(s) encontrado(s).")
-
-    groups = group_files_by_problem(paths, args.data_dir, args.group_by)
-    print(f"  {len(groups)} problema(s) con >= 2 variantes.")
-    if not groups:
-        raise SystemExit(
-            "No se encontraron problemas con multiples variantes. "
-            "Revisa --data-dir y --group-by."
+        feats = compute_features(
+            data_a["tokens"], data_a["depth"], data_a["fps"],
+            data_b["tokens"], data_b["depth"], data_b["fps"],
+            k=k,
         )
+        feats["label"] = 1
+        feats["file_a"] = str(path_a)
+        feats["file_b"] = str(path_b)
+        pairs.append(feats)
 
-    print(f"Tokenizando y generando huellas (k={args.k}, w={args.w}, "
-          f"masking={args.masking}) ...")
-    profiles = _load_profiles(paths, args.k, args.w, level)
+    return pairs
 
-    positives, negatives = generate_pairs(
-        groups, profiles, args.max_pos_per_problem, rng
+
+def _build_negative_pairs(
+    problems: dict[str, list[Path]],
+    n_negatives: int,
+    cache: dict[Path, dict],
+    masking: str,
+    k: int,
+    w: int,
+    seed: int,
+) -> list[dict]:
+    """
+    Muestrea n_negatives pares entre problemas DISTINTOS (label=0).
+    """
+    rng = random.Random(seed)
+    problem_names = list(problems.keys())
+    pairs = []
+    attempts = 0
+    max_attempts = n_negatives * 10
+
+    while len(pairs) < n_negatives and attempts < max_attempts:
+        attempts += 1
+
+        # Elegir dos problemas distintos al azar
+        prob_a, prob_b = rng.sample(problem_names, 2)
+        path_a = rng.choice(problems[prob_a])
+        path_b = rng.choice(problems[prob_b])
+
+        # Preprocesar y cachear
+        if path_a not in cache:
+            cache[path_a] = _preprocess(path_a, masking, k, w)
+        if path_b not in cache:
+            cache[path_b] = _preprocess(path_b, masking, k, w)
+
+        data_a = cache[path_a]
+        data_b = cache[path_b]
+
+        if data_a is None or data_b is None:
+            continue
+
+        feats = compute_features(
+            data_a["tokens"], data_a["depth"], data_a["fps"],
+            data_b["tokens"], data_b["depth"], data_b["fps"],
+            k=k,
+        )
+        feats["label"] = 0
+        feats["file_a"] = str(path_a)
+        feats["file_b"] = str(path_b)
+        pairs.append(feats)
+
+    return pairs
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Función principal pública
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_pairs_csv(
+    data_dir: str | Path,
+    output: str | Path = "pairs_features.csv",
+    k: int = 23,
+    w: int = 4,
+    masking: str = "medium",
+    seed: int = 42,
+    verbose: bool = True,
+) -> Path:
+    """
+    Genera pairs_features.csv a partir del dataset de Kaggle.
+
+    Parámetros
+    ----------
+    data_dir : directorio raíz del dataset
+    output   : ruta del CSV de salida
+    k        : tamaño del k-grama para Winnowing
+    w        : tamaño de ventana para Winnowing
+    masking  : nivel de enmascaramiento ("low" / "medium" / "high")
+    seed     : semilla para el muestreo de pares negativos
+    verbose  : imprimir progreso en consola
+
+    Retorna
+    -------
+    Path del CSV generado
+    """
+    data_dir = Path(data_dir)
+    output   = Path(output)
+
+    if not data_dir.exists():
+        raise FileNotFoundError(f"No se encontró el directorio: {data_dir}")
+
+    # ── 1. Recolectar problemas ───────────────────────────────────────────────
+    problems = _collect_problems(data_dir)
+    if not problems:
+        raise ValueError(f"No se encontraron archivos .py en: {data_dir}")
+
+    if verbose:
+        total_files = sum(len(v) for v in problems.values())
+        print(f"Problemas encontrados : {len(problems)}")
+        print(f"Archivos .py totales  : {total_files}")
+
+    # ── 2. Pares positivos (todos los C(n,2) por problema) ───────────────────
+    cache: dict[Path, dict] = {}
+    positive_pairs: list[dict] = []
+
+    for i, (prob_name, files) in enumerate(problems.items(), 1):
+        if verbose:
+            print(f"  [{i:3d}/{len(problems)}] {prob_name} — {len(files)} archivos", end="\r")
+
+        pos = _build_positive_pairs(files, cache, masking, k, w)
+        positive_pairs.extend(pos)
+
+    if verbose:
+        print(f"\nPares positivos (label=1): {len(positive_pairs)}")
+
+    # ── 3. Pares negativos (balanceados con los positivos) ───────────────────
+    n_neg = len(positive_pairs)
+    negative_pairs = _build_negative_pairs(problems, n_neg, cache, masking, k, w, seed)
+
+    if verbose:
+        print(f"Pares negativos (label=0): {len(negative_pairs)}")
+
+    # ── 4. Mezclar y guardar CSV ──────────────────────────────────────────────
+    all_pairs = positive_pairs + negative_pairs
+    rng = random.Random(seed)
+    rng.shuffle(all_pairs)
+
+    columns = FEATURE_COLUMNS + ["label", "file_a", "file_b"]
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(all_pairs)
+
+    if verbose:
+        print(f"\nCSV guardado en : {output}")
+        print(f"Total de filas  : {len(all_pairs)}")
+
+    return output
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Genera pairs_features.csv para el detector de plagio."
     )
-    print(f"  {len(positives)} pares positivos, {len(negatives)} pares negativos.")
-
-    rows = write_csv(args.output, positives, negatives, profiles)
-    print(f"Listo: {rows} filas escritas en {args.output}")
+    p.add_argument("--data-dir",  required=True,         help="Directorio raíz del dataset")
+    p.add_argument("--output",    default="pairs_features.csv", help="Ruta del CSV de salida")
+    p.add_argument("--k",         type=int, default=23,  help="Tamaño del k-grama (default: 23)")
+    p.add_argument("--w",         type=int, default=4,   help="Ventana Winnowing  (default: 4)")
+    p.add_argument("--masking",   default="medium",
+                   choices=["low", "medium", "high"],    help="Nivel de enmascaramiento")
+    p.add_argument("--seed",      type=int, default=42,  help="Semilla aleatoria")
+    p.add_argument("--quiet",     action="store_true",   help="Suprimir salida de progreso")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = _parse_args()
+    build_pairs_csv(
+        data_dir = args.data_dir,
+        output   = args.output,
+        k        = args.k,
+        w        = args.w,
+        masking  = args.masking,
+        seed     = args.seed,
+        verbose  = not args.quiet,
+    )

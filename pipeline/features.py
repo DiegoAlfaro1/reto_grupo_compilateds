@@ -1,129 +1,157 @@
-"""Extraccion del vector de caracteristicas por par de archivos.
+"""
+pipeline/features.py
+────────────────────
+Calcula el vector de 5 características para un par de archivos Python.
+Este vector es la entrada al modelo de ML (model.ipynb).
 
-Produce exactamente las columnas que consume ``model.ipynb``:
+Características calculadas
+--------------------------
+  1. winnowing_similarity      |A∩B| / min(|A|,|B|)          estilo Dolos
+  2. fingerprint_jaccard       |A∩B| / |A∪B|                 sobre fingerprints
+  3. token_overlap_ratio       Jaccard sobre conjuntos de k-gramas de tokens
+  4. shared_fragment_coverage  cobertura promedio de tokens cubiertos por
+                               fragmentos compartidos entre A y B
+  5. ast_depth_difference      diferencia normalizada de profundidad del AST
 
-    winnowing_similarity, shared_fragment_coverage, token_overlap_ratio,
-    ast_depth_difference, fingerprint_jaccard
+Todas las métricas están en [0, 1].
 
-Todas las caracteristicas estan normalizadas al rango [0, 1]. Las cuatro
-primeras y la ultima son "similitudes" (mas alto = mas parecido); la cuarta,
-``ast_depth_difference``, es una diferencia normalizada (mas alto = mas
-distinto). El clasificador aprende el signo de cada relacion durante el
-entrenamiento.
+Uso rápido
+----------
+    from pipeline.features import compute_features
+
+    feats = compute_features(
+        tokens_a, depth_a, fingerprints_a,
+        tokens_b, depth_b, fingerprints_b,
+        k=23,
+    )
+    # feats es un dict con las 5 claves del modelo
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Sequence, Set, Tuple
+from pipeline.winnowing import (
+    winnowing_similarity,
+    fingerprint_jaccard,
+    kgrams,
+)
 
-from .ast_tokenizer import MaskingLevel, ast_depth, tokenize_source
-from .winnowing import DEFAULT_K, DEFAULT_W, fingerprint_source, kgram_hashes
 
-# Orden EXACTO esperado por el notebook (FEATURE_COLUMNS en model.ipynb).
-FEATURE_COLUMNS: List[str] = [
+# ──────────────────────────────────────────────────────────────────────────────
+# Columnas que espera model.ipynb  (FEATURE_COLUMNS del notebook)
+# ──────────────────────────────────────────────────────────────────────────────
+
+FEATURE_COLUMNS = [
     "winnowing_similarity",
     "shared_fragment_coverage",
     "token_overlap_ratio",
     "ast_depth_difference",
     "fingerprint_jaccard",
 ]
-LABEL_COLUMN = "label"
 
 
-@dataclass
-class CodeProfile:
-    """Representacion preprocesada de un archivo, reutilizable en muchos pares.
+# ──────────────────────────────────────────────────────────────────────────────
+# Métricas individuales
+# ──────────────────────────────────────────────────────────────────────────────
 
-    Calcular esto una sola vez por archivo evita re-tokenizar O(n^2) veces al
-    comparar todos los pares de un problema.
+def token_overlap_ratio(tokens_a: list[str], tokens_b: list[str], k: int) -> float:
     """
+    Jaccard sobre los *conjuntos* de k-gramas de tokens (sin contar frecuencia).
 
-    tokens: List[str]
-    kgrams: Set[int]                       # conjunto de hashes de k-gramas
-    fingerprints: Set[Tuple[int, int]]     # huellas Winnowing (hash, posicion)
-    fp_hashes: Set[int]                    # solo los valores de hash
-    depth: int
+        |kgrams(A) ∩ kgrams(B)| / |kgrams(A) ∪ kgrams(B)|
 
-    @property
-    def n_tokens(self) -> int:
-        return len(self.tokens)
-
-
-def build_profile(
-    source: str,
-    k: int = DEFAULT_K,
-    w: int = DEFAULT_W,
-    level: MaskingLevel = MaskingLevel.MEDIUM,
-) -> CodeProfile:
-    """Preprocesa una cadena de codigo en un ``CodeProfile``."""
-    tokens = tokenize_source(source, level)
-    kgrams = set(kgram_hashes(tokens, k))
-    fingerprints = fingerprint_source(tokens, k, w)
-    fp_hashes = {h for h, _ in fingerprints}
-    depth = ast_depth(source)
-    return CodeProfile(
-        tokens=tokens,
-        kgrams=kgrams,
-        fingerprints=fingerprints,
-        fp_hashes=fp_hashes,
-        depth=depth,
-    )
+    Mide cuántas sub-secuencias estructurales comparten los dos archivos,
+    independientemente del orden global.
+    """
+    set_a = set(kgrams(tokens_a, k))
+    set_b = set(kgrams(tokens_b, k))
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    return len(set_a & set_b) / len(union)
 
 
-def _safe_div(a: float, b: float) -> float:
-    return a / b if b else 0.0
+def shared_fragment_coverage(
+    tokens_a: list[str],
+    tokens_b: list[str],
+    k: int,
+) -> float:
+    """
+    Fracción promedio de tokens de cada archivo que están cubiertos por
+    al menos un k-grama compartido.
+
+    Algoritmo
+    ---------
+    1. Encontrar los k-gramas comunes entre A y B.
+    2. Para cada archivo, marcar las posiciones de tokens que pertenecen
+       a al menos un k-grama compartido.
+    3. coverage_X = posiciones_marcadas_X / len(tokens_X)
+    4. Retornar (coverage_A + coverage_B) / 2
+    """
+    common = set(kgrams(tokens_a, k)) & set(kgrams(tokens_b, k))
+    if not common:
+        return 0.0
+
+    def _covered_positions(tokens: list[str]) -> int:
+        n = len(tokens)
+        covered = [False] * n
+        for i in range(n - k + 1):
+            gram = tuple(tokens[i : i + k])
+            if gram in common:
+                for j in range(i, i + k):
+                    covered[j] = True
+        return sum(covered)
+
+    cov_a = _covered_positions(tokens_a) / len(tokens_a) if tokens_a else 0.0
+    cov_b = _covered_positions(tokens_b) / len(tokens_b) if tokens_b else 0.0
+    return (cov_a + cov_b) / 2.0
 
 
-def pair_features(a: CodeProfile, b: CodeProfile) -> Dict[str, float]:
-    """Calcula el vector de caracteristicas entre dos perfiles de codigo."""
-    shared_fp = a.fp_hashes & b.fp_hashes
-    union_fp = a.fp_hashes | b.fp_hashes
+def ast_depth_difference(depth_a: int, depth_b: int) -> float:
+    """
+    Diferencia normalizada de profundidad máxima del AST.
 
-    # 1. Similitud Winnowing (coeficiente de solapamiento, estilo Dolos):
-    #    fraccion de huellas compartidas respecto al archivo con menos huellas.
-    winnowing_similarity = _safe_div(
-        len(shared_fp), min(len(a.fp_hashes), len(b.fp_hashes))
-    )
+        |depth_A - depth_B| / max(depth_A, depth_B)
 
-    # 2. Cobertura de fragmentos compartidos: que proporcion de las huellas de
-    #    cada archivo participa en el solapamiento, promediada entre ambos.
-    cov_a = _safe_div(len(a.fp_hashes & shared_fp), len(a.fp_hashes))
-    cov_b = _safe_div(len(b.fp_hashes & shared_fp), len(b.fp_hashes))
-    shared_fragment_coverage = (cov_a + cov_b) / 2.0
+    0 → misma profundidad   1 → profundidades muy distintas
+    """
+    max_d = max(depth_a, depth_b)
+    if max_d == 0:
+        return 0.0
+    return abs(depth_a - depth_b) / max_d
 
-    # 3. Solapamiento de tokens (a nivel de k-gramas, antes de winnowing):
-    #    Jaccard de los conjuntos de k-gramas.
-    token_overlap_ratio = _safe_div(
-        len(a.kgrams & b.kgrams), len(a.kgrams | b.kgrams)
-    )
 
-    # 4. Diferencia de profundidad del AST, normalizada a [0, 1].
-    ast_depth_difference = _safe_div(
-        abs(a.depth - b.depth), max(a.depth, b.depth)
-    )
+# ──────────────────────────────────────────────────────────────────────────────
+# Función principal pública
+# ──────────────────────────────────────────────────────────────────────────────
 
-    # 5. Jaccard de las huellas digitales.
-    fingerprint_jaccard = _safe_div(len(shared_fp), len(union_fp))
+def compute_features(
+    tokens_a: list[str],
+    depth_a: int,
+    fingerprints_a: frozenset[int],
+    tokens_b: list[str],
+    depth_b: int,
+    fingerprints_b: frozenset[int],
+    k: int = 23,
+) -> dict[str, float]:
+    """
+    Calcula las 5 características para un par de archivos.
 
+    Parámetros
+    ----------
+    tokens_a / tokens_b         : salida de ast_tokenizer (campo "tokens")
+    depth_a  / depth_b          : salida de ast_tokenizer (campo "max_depth")
+    fingerprints_a / _b         : salida de winnow()
+    k                           : tamaño de k-grama (debe coincidir con el usado
+                                  al generar los fingerprints)
+
+    Retorna
+    -------
+    dict con exactamente las claves de FEATURE_COLUMNS, valores en [0, 1].
+    """
     return {
-        "winnowing_similarity": winnowing_similarity,
-        "shared_fragment_coverage": shared_fragment_coverage,
-        "token_overlap_ratio": token_overlap_ratio,
-        "ast_depth_difference": ast_depth_difference,
-        "fingerprint_jaccard": fingerprint_jaccard,
+        "winnowing_similarity": winnowing_similarity(fingerprints_a, fingerprints_b),
+        "shared_fragment_coverage": shared_fragment_coverage(tokens_a, tokens_b, k),
+        "token_overlap_ratio": token_overlap_ratio(tokens_a, tokens_b, k),
+        "ast_depth_difference": ast_depth_difference(depth_a, depth_b),
+        "fingerprint_jaccard": fingerprint_jaccard(fingerprints_a, fingerprints_b),
     }
-
-
-def features_from_sources(
-    source_a: str,
-    source_b: str,
-    k: int = DEFAULT_K,
-    w: int = DEFAULT_W,
-    level: MaskingLevel = MaskingLevel.MEDIUM,
-) -> Dict[str, float]:
-    """Conveniencia: par de cadenas de codigo -> vector de caracteristicas."""
-    return pair_features(
-        build_profile(source_a, k, w, level),
-        build_profile(source_b, k, w, level),
-    )

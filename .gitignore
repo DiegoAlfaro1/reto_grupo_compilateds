@@ -1,3 +1,7 @@
+dataset/
+data/
+pipeline_disabled/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
