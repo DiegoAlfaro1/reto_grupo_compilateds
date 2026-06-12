@@ -1,0 +1,32 @@
+[
+  {
+    "name":"different_pair",
+    "expected_label":0,
+    "probability":0.000144357,
+    "verdict":"NO PLAGIO",
+    "threshold":0.18,
+    "winnowing_similarity":0.0,
+    "token_sequence_ratio":0.5148514851,
+    "length_ratio":0.6031746032
+  },
+  {
+    "name":"empty_pair",
+    "expected_label":0,
+    "probability":0.8384554386,
+    "verdict":"PLAGIO",
+    "threshold":0.18,
+    "winnowing_similarity":0.0,
+    "token_sequence_ratio":1.0,
+    "length_ratio":1.0
+  },
+  {
+    "name":"similar_pair",
+    "expected_label":1,
+    "probability":0.0111135729,
+    "verdict":"NO PLAGIO",
+    "threshold":0.18,
+    "winnowing_similarity":0.15,
+    "token_sequence_ratio":0.6941176471,
+    "length_ratio":0.7171717172
+  }
+]

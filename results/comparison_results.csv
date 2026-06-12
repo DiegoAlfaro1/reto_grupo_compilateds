@@ -1,0 +1,4 @@
+name,expected_label,probability,verdict,threshold,winnowing_similarity,token_sequence_ratio,length_ratio
+different_pair,0,0.00014435700722970068,NO PLAGIO,0.18,0.0,0.5148514851485149,0.6031746031746031
+empty_pair,0,0.8384554386138916,PLAGIO,0.18,0.0,1.0,1.0
+similar_pair,1,0.011113572865724564,NO PLAGIO,0.18,0.15,0.6941176470588235,0.7171717171717171
