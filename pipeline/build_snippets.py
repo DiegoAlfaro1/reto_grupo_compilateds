@@ -16,8 +16,11 @@ Uso
         --output new_data_features/train_features.parquet \
         --k 15 --w 4 --masking medium --workers 8
 
-    # Para experimentar rápido con una muestra:
+    # Para experimentar rápido con una muestra por conteo absoluto:
     python -m pipeline.build_snippets --input ... --output ... --sample 50000
+
+    # Para usar el 40 % del dataset:
+    python -m pipeline.build_snippets --input ... --output ... --fraction 0.4
 """
 
 from __future__ import annotations
@@ -56,13 +59,26 @@ def build_features(
     w: int = 4,
     masking: str = "medium",
     sample: int | None = None,
+    fraction: float | None = None,
     workers: int = 1,
 ) -> pd.DataFrame:
-    """Calcula las características de cada snippet del parquet de entrada."""
+    """Calcula las características de cada snippet del parquet de entrada.
+
+    Si se pasan ambos --sample y --fraction, se aplica primero la fracción
+    y luego el conteo absoluto (se queda el más pequeño).
+    """
     input_path = Path(input_path)
     output_path = Path(output_path)
 
     df = pd.read_parquet(input_path)
+
+    if fraction is not None:
+        if not (0.0 < fraction <= 1.0):
+            raise ValueError(f"--fraction debe ser un valor entre 0 y 1 (recibido: {fraction})")
+        n_fraction = max(1, int(len(df) * fraction))
+        if fraction < 1.0:
+            df = df.sample(n=n_fraction, random_state=RANDOM_SEED).reset_index(drop=True)
+
     if sample is not None and sample < len(df):
         df = df.sample(n=sample, random_state=RANDOM_SEED).reset_index(drop=True)
 
@@ -104,7 +120,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--sample", type=int, default=None,
-        help="muestrear N filas (None = todas)",
+        help="muestrear N filas en absoluto (None = todas)",
+    )
+    parser.add_argument(
+        "--fraction", type=float, default=None,
+        help="fracción del dataset a usar, p.ej. 0.4 para el 40%% (None = todas)",
     )
     parser.add_argument(
         "--workers", type=int, default=1,
@@ -119,6 +139,7 @@ def main(argv: list[str] | None = None) -> None:
         w=args.w,
         masking=args.masking,
         sample=args.sample,
+        fraction=args.fraction,
         workers=args.workers,
     )
 

@@ -46,7 +46,7 @@ entrenamiento (500k), validación (100k) y muestra de prueba (1k).
 - **La arquitectura del modelo no cambia** (misma red basada en el paper
   de Dolos: Dense 32 → Dropout 0.2 → Dense 16 → sigmoide).
 - **Cambia la alimentación de datos**: como ya no hay pares de archivos,
-  `pipeline/snippet_features.py` calcula 16 características *intrínsecas*
+  `pipeline/snippet_features.py` calcula 16 características _intrínsecas_
   por snippet con la misma maquinaria (tokenización AST normalizada +
   Winnowing k=15, w=4) más métricas de estilo (comentarios, líneas en
   blanco, identificadores...). Para lenguajes distintos de Python,
@@ -114,44 +114,18 @@ pairs_features.csv   ── pipeline/build_pairs.py
 `model.ipynb` importa `FEATURE_COLUMNS` de `pipeline/features.py`, por lo que
 notebook y pipeline no pueden desincronizarse. Columnas:
 
-| Columna | Significado | Rango |
-|---|---|---|
-| `winnowing_similarity` | Huellas compartidas / mín(huellas de cada archivo) (estilo Dolos) | [0,1] |
-| `shared_fragment_coverage` | Cobertura promedio de fragmentos compartidos entre ambos archivos | [0,1] |
-| `token_overlap_ratio` | Jaccard de los conjuntos de k-gramas (nivel de tokens) | [0,1] |
-| `ast_depth_difference` | Diferencia normalizada de profundidad del AST (mayor = más distinto) | [0,1] |
-| `fingerprint_jaccard` | Jaccard de las huellas digitales | [0,1] |
-| `small_kgram_jaccard` | Jaccard de k-gramas pequeños (k=4); robusto en archivos cortos | [0,1] |
-| `node_type_cosine` | Coseno entre histogramas de tipos de nodo AST | [0,1] |
-| `token_sequence_ratio` | Similitud de secuencia (difflib) entre cadenas de tokens | [0,1] |
-| `length_ratio` | mín(tokens) / máx(tokens) | [0,1] |
-| `label` | 1 = plagio (misma fuente, ofuscada), 0 = no plagio | {0,1} |
-
-## Uso
-
-```bash
-pip install -r requirements.txt
-
-# 0) Generar el dataset ad hoc (descarga el de Kaggle con kagglehub si hace falta)
-python -m pipeline.generate_dataset --output-dir data --variants 4
-
-# 1) Generar el CSV de características
-python -m pipeline.build_pairs --data-dir data \
-    --output pairs_features.csv --k 15 --w 4 --masking medium
-
-# 2) Entrenar el modelo
-jupyter notebook model.ipynb      # detecta y carga pairs_features.csv
-```
-
-El entrenamiento guarda tres artefactos: `plagiarism_model.keras`,
-`scaler.joblib` y `decision_threshold.json` (umbral + parámetros del pipeline).
-
-Parámetros configurables (variables independientes del marco de referencia):
-
-- `--k` tamaño de k-grama (`5, 10, 15` elegido, `23` default Dolos, `30`)
-- `--w` ventana de Winnowing (`4, 8, 16`)
-- `--masking` nivel de enmascaramiento: `low` / `medium` / `high`
-- `--variants` (generate_dataset) variantes plagiadas por snippet
+| Columna                    | Significado                                                          | Rango |
+| -------------------------- | -------------------------------------------------------------------- | ----- |
+| `winnowing_similarity`     | Huellas compartidas / mín(huellas de cada archivo) (estilo Dolos)    | [0,1] |
+| `shared_fragment_coverage` | Cobertura promedio de fragmentos compartidos entre ambos archivos    | [0,1] |
+| `token_overlap_ratio`      | Jaccard de los conjuntos de k-gramas (nivel de tokens)               | [0,1] |
+| `ast_depth_difference`     | Diferencia normalizada de profundidad del AST (mayor = más distinto) | [0,1] |
+| `fingerprint_jaccard`      | Jaccard de las huellas digitales                                     | [0,1] |
+| `small_kgram_jaccard`      | Jaccard de k-gramas pequeños (k=4); robusto en archivos cortos       | [0,1] |
+| `node_type_cosine`         | Coseno entre histogramas de tipos de nodo AST                        | [0,1] |
+| `token_sequence_ratio`     | Similitud de secuencia (difflib) entre cadenas de tokens             | [0,1] |
+| `length_ratio`             | mín(tokens) / máx(tokens)                                            | [0,1] |
+| `label`                    | 1 = plagio (misma fuente, ofuscada), 0 = no plagio                   | {0,1} |
 
 ## Dataset
 
