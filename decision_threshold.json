@@ -1,0 +1,23 @@
+{
+  "threshold": 0.8799999999999999,
+  "k": 15,
+  "w": 4,
+  "masking": "medium",
+  "feature_columns": [
+    "winnowing_similarity",
+    "shared_fragment_coverage",
+    "token_overlap_ratio",
+    "ast_depth_difference",
+    "fingerprint_jaccard",
+    "small_kgram_jaccard",
+    "node_type_cosine",
+    "token_sequence_ratio",
+    "length_ratio"
+  ],
+  "test_metrics": {
+    "precision": 0.9846,
+    "recall": 0.96,
+    "f1": 0.9722,
+    "auc": 0.9986
+  }
+}

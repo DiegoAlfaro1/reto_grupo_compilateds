@@ -7,22 +7,26 @@ Recorre el dataset de Kaggle, construye pares etiquetados y calcula
 las 5 características por par usando el pipeline completo:
     ast_tokenizer → winnowing → features
 
-Estructura esperada del dataset
---------------------------------
+Estructura esperada del dataset (generado por pipeline/generate_dataset.py)
+----------------------------------------------------------------------------
     data_dir/
-        problema_1/
-            snippets/
-                snip_01.py
-                snip_02.py
-                ...
-        problema_2/
-            snippets/
-                ...
+        fibonacci__snip_01/        ← grupo de plagio (fuente + variantes)
+            original.py
+            variant_1.py
+            ...
+        fibonacci__snip_02/
+            ...
 
-Etiquetas
----------
-    1  →  par positivo: dos .py del MISMO problema
-    0  →  par negativo: dos .py de problemas DISTINTOS
+También soporta el layout Kaggle original (problema/snippets/*.py).
+
+Etiquetas (iteración 2)
+-----------------------
+    1  →  par positivo: dos .py del MISMO grupo (derivan de la misma fuente,
+          es decir, uno es ofuscación del otro → plagio real)
+    0  →  par negativo: dos .py de grupos DISTINTOS. La mitad se muestrea
+          del MISMO problema (negativos difíciles: resuelven lo mismo con
+          algoritmos distintos, NO es plagio según el alcance del marco)
+          y la otra mitad de problemas distintos (negativos fáciles).
 
 Uso desde línea de comandos
 ---------------------------
@@ -152,6 +156,15 @@ def _build_positive_pairs(
     return pairs
 
 
+def _problem_of(group_name: str) -> str:
+    """Extrae el problema original del nombre del grupo.
+
+    'fibonacci__snip_01' → 'fibonacci'.  Para el layout Kaggle (sin '__')
+    el grupo ES el problema, por lo que no existen negativos difíciles.
+    """
+    return group_name.split("__")[0]
+
+
 def _build_negative_pairs(
     problems: dict[str, list[Path]],
     n_negatives: int,
@@ -162,21 +175,47 @@ def _build_negative_pairs(
     seed: int,
 ) -> list[dict]:
     """
-    Muestrea n_negatives pares entre problemas DISTINTOS (label=0).
+    Muestrea n_negatives pares entre grupos DISTINTOS (label=0).
+
+    50% negativos difíciles : mismo problema, distinta fuente
+    50% negativos fáciles   : problemas distintos
+    (si un problema no tiene 2+ grupos, todos salen del muestreo fácil)
     """
     rng = random.Random(seed)
-    problem_names = list(problems.keys())
+    group_names = list(problems.keys())
+
+    # Agrupar los grupos por problema para los negativos difíciles
+    by_problem: dict[str, list[str]] = {}
+    for g in group_names:
+        by_problem.setdefault(_problem_of(g), []).append(g)
+    multi_group_problems = [p for p, gs in by_problem.items() if len(gs) >= 2]
+
     pairs = []
+    seen_pairs: set[tuple[Path, Path]] = set()
     attempts = 0
-    max_attempts = n_negatives * 10
+    max_attempts = n_negatives * 20
 
     while len(pairs) < n_negatives and attempts < max_attempts:
         attempts += 1
 
-        # Elegir dos problemas distintos al azar
-        prob_a, prob_b = rng.sample(problem_names, 2)
-        path_a = rng.choice(problems[prob_a])
-        path_b = rng.choice(problems[prob_b])
+        want_hard = multi_group_problems and len(pairs) % 2 == 0
+        if want_hard:
+            # Negativo difícil: dos grupos del MISMO problema
+            problem = rng.choice(multi_group_problems)
+            grp_a, grp_b = rng.sample(by_problem[problem], 2)
+        else:
+            # Negativo fácil: dos grupos cualesquiera de problemas distintos
+            grp_a, grp_b = rng.sample(group_names, 2)
+            if _problem_of(grp_a) == _problem_of(grp_b):
+                continue
+
+        path_a = rng.choice(problems[grp_a])
+        path_b = rng.choice(problems[grp_b])
+
+        pair_key = (path_a, path_b) if path_a < path_b else (path_b, path_a)
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
 
         # Preprocesar y cachear
         if path_a not in cache:
@@ -246,7 +285,9 @@ def build_pairs_csv(
 
     if verbose:
         total_files = sum(len(v) for v in problems.values())
-        print(f"Problemas encontrados : {len(problems)}")
+        n_problems = len({_problem_of(g) for g in problems})
+        print(f"Grupos de plagio      : {len(problems)}")
+        print(f"Problemas originales  : {n_problems}")
         print(f"Archivos .py totales  : {total_files}")
 
     # ── 2. Pares positivos (todos los C(n,2) por problema) ───────────────────
